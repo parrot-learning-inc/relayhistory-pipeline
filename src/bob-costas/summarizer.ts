@@ -41,6 +41,7 @@ export interface Summarizer {
 /** Parses scrubbed JSONL transcript records into a digest. Harness-agnostic best effort. */
 export function digestRecords(harness: string, lines: string[]): SessionDigest {
   const d: SessionDigest = { harness, records: 0, userTurns: [], assistantTurns: 0, toolCalls: {}, models: [] };
+  const seen = new Set<string>();
   for (const line of lines) {
     if (!line.trim()) continue;
     d.records += 1;
@@ -48,6 +49,14 @@ export function digestRecords(harness: string, lines: string[]): SessionDigest {
     try {
       rec = JSON.parse(line) as Record<string, unknown>;
     } catch {
+      continue;
+    }
+    // The delivery envelope a self-hosted client uploads: {kind, operation, payload}. A raw
+    // harness line (below) has neither `payload` nor these kinds.
+    const payload = rec.payload as Record<string, unknown> | undefined;
+    if (payload && typeof payload === "object" && typeof rec.kind === "string") {
+      if (rec.operation === "delete") continue;
+      digestEnvelope(d, rec.kind, payload, seen);
       continue;
     }
     const ts = typeof rec.timestamp === "string" ? rec.timestamp : undefined;
@@ -70,6 +79,37 @@ export function digestRecords(harness: string, lines: string[]): SessionDigest {
     }
   }
   return d;
+}
+
+/**
+ * One delivery-envelope record. A `session_event` carries one block of a turn (`role`, block
+ * `kind`, `text`); a `tool_call` carries the tool's `name`. A record is uploaded again when it
+ * is revised, so each is counted once by its uid. Harness-injected user text (`control_kind`:
+ * a system reminder, the Codex context wrapper) is not a user turn.
+ */
+function digestEnvelope(d: SessionDigest, kind: string, p: Record<string, unknown>, seen: Set<string>): void {
+  const uid = kind === "session_event" ? p.event_uid : kind === "tool_call" ? p.tool_use_id ?? p.id : undefined;
+  if (typeof uid === "string" || typeof uid === "number") {
+    const key = `${kind}:${uid}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+  }
+  if (kind === "tool_call") {
+    if (typeof p.name === "string" && p.name) d.toolCalls[p.name] = (d.toolCalls[p.name] ?? 0) + 1;
+    return;
+  }
+  if (kind !== "session_event") return;
+  if (typeof p.ts_ms === "number" && p.ts_ms > 0) {
+    const ts = new Date(p.ts_ms).toISOString();
+    d.firstTs ??= ts;
+    d.lastTs = ts;
+  }
+  if (p.role === "user") {
+    if (p.kind === "text" && !p.control_kind && typeof p.text === "string" && p.text.trim()) d.userTurns.push(p.text);
+  } else if (p.role === "assistant") {
+    if (p.kind === "text") d.assistantTurns += 1;
+    if (typeof p.model === "string" && p.model && !d.models.includes(p.model)) d.models.push(p.model);
+  }
 }
 
 function textOf(content: unknown): string | undefined {
