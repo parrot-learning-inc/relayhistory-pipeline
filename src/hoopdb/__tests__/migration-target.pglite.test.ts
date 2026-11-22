@@ -738,7 +738,7 @@ test("real tree: the prefix-scoped ACL check excuses only absent functions a hel
   // Unscoped, the full manifest names every held function as missing.
   const unscoped = await sessionsFunctionAclDrift(c, "history_rt");
   expect(unscoped.length).toBeGreaterThan(0);
-  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_|coordination_advisories_|coordination_advisor_|ingest_origin_|ingest_turn_|ingest_set_session_uploads_internal|buffered_turn_sources_for|aa_session_directory_hide_turn_only|ingest_legacy_export_scope_authority_register|legacy_export_privacy_|summary_regeneration_audit_|read_api_token_issue_v2|relayfacts_|relayfacts_evidence_|search_reconcile_|session_analysis_cutover_free|session_analysis_first_seen_v1|org_s3_cutover_|staged_facts_)\w*\(.*\): missing/.test(d))).toBe(true);
+  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_|coordination_advisories_|coordination_advisor_|ingest_origin_|ingest_turn_|ingest_set_session_uploads_internal|buffered_turn_sources_for|aa_session_directory_hide_turn_only|ingest_legacy_export_scope_authority_register|legacy_export_privacy_|summary_regeneration_audit_|read_api_token_issue_v2|relayfacts_|relayfacts_evidence_|search_reconcile_|session_analysis_cutover_free|session_analysis_first_seen_v1|org_s3_cutover_|staged_facts_|session_visibility_)\w*\(.*\): missing/.test(d))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.ingest_operator_runtime_upsert(jsonb,text,text): missing"))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.buffered_session_stages_for_target("))).toBe(true);
   // A function a held step only replaces (it exists) is still compared exactly.
@@ -947,6 +947,36 @@ test("real tree: after the full tree including 062140, the staged output facts w
     ["sessions.staged_facts_reconcile_v1(bigint,uuid,text,text,text,text[],text,boolean,bigint)", "bulls96_read_api"],
     ["sessions.staged_facts_whole_v1(bigint)", "search_consumer_runtime"],
   ] as const) {
+    await s.db.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO ${role}`);
+    expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
+    await s.db.exec(`REVOKE EXECUTE ON FUNCTION ${fn} FROM ${role}`);
+    expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
+  }
+});
+
+test("real tree: after the full tree including 062141, the session visibility functions are EXECUTE for bulls96_read_api only and any other grant is ACL drift", async () => {
+  const s = await prefixDatabase();
+  await runTarget(s.db, s);
+  const SV = "upstream:20261105062141_session_visibility.sql";
+  expect(s.split.held).toContain(SV);
+  const last = s.split.held.at(-1)!;
+  const tailSplit = migrationTargetSplit(s.names.map((name) => ({ name, pending: s.split.held.includes(name) })), last);
+  const full: ExpectedSchema = { ...(await expectedSchema()), dbMode: "selfhosted" };
+  await runMigrations(client(s.db), { profile: SELFHOSTED, target: last, expectedPending: tailSplit.expectedPending, targetGeneration: full.generation });
+  expect(await ledger(s.db)).toContain(SV);
+  expect(await marker(s.db)).toEqual([{ generation: full.generation, status: "pass" }]);
+  // Read-API-only: in neither runtime list.
+  expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.session_visibility_"))).toEqual([]);
+  expect(CONSUMER_RUNTIME_FUNCTIONS.filter((f) => f.startsWith("sessions.session_visibility_"))).toEqual([]);
+  const fns = ["sessions.session_visibility_marks_v1(text)", "sessions.session_visibility_set_v1(text,text,text,text)"];
+  const grantees = async (fn: string) =>
+    (await s.db.query<{ g: string }>(
+      "SELECT DISTINCT CASE a.grantee WHEN 0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END g FROM pg_proc p, aclexplode(p.proacl) a WHERE p.oid = $1::regprocedure AND a.privilege_type = 'EXECUTE' AND a.grantee <> p.proowner ORDER BY 1",
+      [fn])).rows.map((r) => r.g);
+  for (const fn of fns) expect(await grantees(fn), fn).toEqual(["bulls96_read_api"]);
+  const c = client(s.db);
+  expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
+  for (const [fn, role] of [[fns[0]!, "service_role"], [fns[1]!, "search_consumer_runtime"], [fns[1]!, "history_rt"]] as const) {
     await s.db.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO ${role}`);
     expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
     await s.db.exec(`REVOKE EXECUTE ON FUNCTION ${fn} FROM ${role}`);

@@ -65,6 +65,8 @@ import { sqlRelayfacts } from "./relayfacts.ts";
  * them, so the flag has no effect here.
  */
 import pg from "pg";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { READ_API_SESSION_VISIBILITY_GROUPS_VAR, parseSessionVisibilityGroups, sessionVisibility, sqlSessionVisibility, visibilityLiveness, type VisibilityView } from "./session-visibility.ts";
 import { MESSAGE_ORIGIN_LABELS_VAR, messageOriginLabelsEnabled } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import { log } from "../shared/log.ts";
 import { awsJsonCall, lambdaCredentials } from "../session-pipeline/aws-json.ts";
@@ -632,6 +634,12 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   if (authConfig.mode === "self_issued" && entry !== "service")
     throw new Error("session read api: READ_API_AUTH_MODE=self_issued is served only by the self-host service");
   const corsAllowedOrigins = entry === "service" ? readApiCorsOrigins(env) : undefined;
+  // Session visibility (session-visibility.ts): env only, so a malformed value refuses before the pool opens.
+  // The Lambda's facts and write paths carry no visibility filter, so it is refused there, not ignored.
+  const visibilityGroups = parseSessionVisibilityGroups(env);
+  if (visibilityGroups && entry !== "service")
+    throw new Error(`session read api: ${READ_API_SESSION_VISIBILITY_GROUPS_VAR} is served only by the self-host service`);
+  const visibilityScope = new AsyncLocalStorage<VisibilityView>();
   // Analytics (src/shared/analytics-config.ts), before the pool opens: the service takes the self-host
   // profile (noop or collector, never PostHog). The Lambda has no analytics wiring, so a selection there
   // is refused rather than silently ignored.
@@ -688,11 +696,16 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const adapter = backend === "clickhouse" ? undefined : composeSearchService(composition!, { env, sql: pool, secrets: searchSecret(secret.search) }, "reader", poolTenantRunner(pool as never));
   if (adapter && await adapter.state.fromMs(new Date()) > completeSinceMs) throw new Error("read history floor is below search coverage");
   if (searchSkipPartial && adapter) assertSkipExcludes(adapter);
+  // Hidden sessions leave a search through SearchQuery.excludeSessionIds: a backend that may ignore it is refused.
+  if (visibilityGroups && adapter && !adapter.index.capabilities().filters.includes("exclude_session"))
+    throw new Error(`session read api: ${READ_API_SESSION_VISIBILITY_GROUPS_VAR} needs a search backend that excludes sessions; ${adapter.index.backend} does not`);
   // The self-host service only: canonical S3 (LOCKER_*) behind timing, turns,
   // metadata and catalog. The hosted Lambda never builds it (those routes keep
   // their 501 `*_not_configured` there).
   const canonical = entry === "service" ? await serviceCanonicalDeps(env, poolTenantRunner(pool as never)) : undefined;
-  const liveness = sqlLiveness(poolTenantRunner(pool as never));
+  // With session visibility, every consumer of `erased` (event pages, Output, the digest, overlaps) also
+  // leaves out the sessions hidden from the request's caller.
+  const liveness = visibilityGroups ? visibilityLiveness(sqlLiveness(poolTenantRunner(pool as never)), visibilityScope) : sqlLiveness(poolTenantRunner(pool as never));
   const operatorErased = entry === "service" && eraseRuntimeFlag(env, ERASE_FENCE_FLAG)
     ? sqlOperatorErased(poolTenantRunner(pool as never)) : undefined;
   // The self-host service only, READ_API_DIGEST_ENABLED=1 (digest-narrative-selfhost.ts): the
@@ -748,6 +761,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...advisoriesDeps,
     ...(authConfig.selfIssued ? { selfIssued: { ...authConfig.selfIssued, store: sqlTokenStore(pool as never) } } : {}),
     ...(corsAllowedOrigins?.size ? { corsAllowedOrigins } : {}),
+    ...(visibilityGroups ? { sessionVisibility: sessionVisibility(visibilityGroups, sqlSessionVisibility(poolTenantRunner(pool as never), poolTenantWriter(pool as never)), visibilityScope) } : {}),
     ...(selfhostReadApi ? { selfhost: { ...(authConfig.mode === "self_issued" ? {} : { login: relaycontrolLogin(authConfig) }), ...(canonical ? { catalog: canonical.catalog } : {}), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),
     log: (fields) => log.info("session read", fields),
   };

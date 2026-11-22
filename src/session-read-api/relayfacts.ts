@@ -237,6 +237,20 @@ export interface RelayfactsRouteHelpers {
   bad(message: string): Error;
   unsupported(reason: string): Error;
   fail(c: Context, error: unknown): Response;
+  /** Session visibility only: true for a session id hidden from this request's caller. */
+  hidden?(c: Context, sessionId: string): boolean;
+}
+
+/**
+ * Session visibility: the records without the evidence rows of hidden sessions, and without any record
+ * whose evidence is all from hidden sessions (a record that never had evidence stays).
+ */
+export function visibleRelayfacts(rows: readonly RelayfactsRecordRow[], hidden: (sessionId: string) => boolean): RelayfactsRecordRow[] {
+  return rows.flatMap((row) => {
+    const evidence = evidenceRows(row.evidence);
+    const shown = evidence.filter((e) => !hidden(e.session_id));
+    return evidence.length > 0 && shown.length === 0 ? [] : [{ ...row, evidence: shown }];
+  });
 }
 
 const LIST_PARAMS = ["workspace"];
@@ -283,10 +297,12 @@ export function registerRelayfactsRoutes(app: Hono<any>, documents: Relayfacts |
       if (rows === null) throw h.unsupported("relayfacts_not_migrated");
       const last = rows.at(-1);
       if (last && (!CURSOR_AT.test(last.created_cursor) || !UUID.test(last.id))) throw new RelayfactsError("parse");
-      const markdown = relayfactsMarkdown(topic, rows, { continued: after !== null });
+      // The cursor above is the unfiltered page's (record ids only); hidden sessions' evidence never leaves.
+      const shown = h.hidden ? visibleRelayfacts(rows, (sessionId) => h.hidden!(c, sessionId)) : rows;
+      const markdown = relayfactsMarkdown(topic, shown, { continued: after !== null });
       return c.json({
         topic,
-        records: rows.length,
+        records: shown.length,
         nextCursor: last && rows.length === limit ? encodeRelayfactsCursor({ createdAt: last.created_cursor, id: last.id }) : null,
         markdown,
       });

@@ -16,7 +16,8 @@
  * RelayAuth verifier entirely (lambda.ts readApiAuthConfig, auth.ts).
  * Like the Lambda and the Worker it answers GET, plus one POST route, `POST /v1/cli/login` (READ_API_AUTH_MODE=self_issued
  * adds the token routes of self-issued.ts; READ_API_COORDINATION_ADVISORIES_ENABLED=true adds
- * `POST /v1/coordination/advisories/:advisoryId/ack`; READ_API_CORS_ALLOWED_ORIGINS adds OPTIONS preflight), whose JSON
+ * `POST /v1/coordination/advisories/:advisoryId/ack`; READ_API_SESSION_VISIBILITY_GROUPS adds
+ * `POST /v1/sessions/:sessionId/visibility`; READ_API_CORS_ALLOWED_ORIGINS adds OPTIONS preflight), whose JSON
  * bodies are the only request bodies ever read. It is buffered here with a hard
  * cap (LOGIN_BODY_CAP_BYTES, 413 beyond it) before the app sees it; every
  * other request body is drained, never read.
@@ -33,6 +34,7 @@ import { ADVISORY_ACK_PATH } from "./app.ts";
 import { exactTrueFlag, parseCompleteSince, READ_API_COORDINATION_ADVISORIES_ENABLED } from "./config.ts";
 import { readApiAuthMode, readApiCorsOrigins, readAppFromSecret, serviceSearchBackend } from "./lambda.ts";
 import { TOKEN_ROUTE_PATHS } from "./self-issued.ts";
+import { SESSION_VISIBILITY_PATH, parseSessionVisibilityGroups } from "./session-visibility.ts";
 import { readApiServiceConfig, SEARCH_BACKEND_ID_VAR } from "./service-config.ts";
 
 type FetchApp = { fetch(req: Request): Response | Promise<Response> };
@@ -69,7 +71,7 @@ const LOGIN_PATH = "/v1/cli/login";
 const LOGIN_BODY_CAP_BYTES = 8 * 1024;
 
 /** The routes the service answers: `/healthz` always, then the read API (enabled) or 503 (dormant). */
-export function readApiServiceApp(app: FetchApp | null, routes: { tokenRoutes?: boolean; cors?: boolean; advisoryAck?: boolean } = {}): Hono {
+export function readApiServiceApp(app: FetchApp | null, routes: { tokenRoutes?: boolean; cors?: boolean; advisoryAck?: boolean; sessionVisibility?: boolean } = {}): Hono {
   const service = new Hono();
   service.get("/healthz", (c) => c.json({ ok: true, enabled: app !== null }));
   if (!app) {
@@ -88,7 +90,9 @@ export function readApiServiceApp(app: FetchApp | null, routes: { tokenRoutes?: 
     const tokenRoute = routes.tokenRoutes === true && TOKEN_ROUTE_PATHS.includes(c.req.path) && TOKEN_ROUTE_PATHS.includes(url);
     // READ_API_COORDINATION_ADVISORIES_ENABLED=true only: the advisory ack POST.
     const advisoryAck = routes.advisoryAck === true && ADVISORY_ACK_PATH.test(c.req.path) && ADVISORY_ACK_PATH.test(url);
-    if (c.req.method === "GET" || (login && c.req.method === "POST") || (tokenRoute && c.req.method === "POST") || (advisoryAck && c.req.method === "POST") || (routes.cors === true && c.req.method === "OPTIONS")) return app.fetch(c.req.raw);
+    // READ_API_SESSION_VISIBILITY_GROUPS set only: the session visibility POST.
+    const visibilityPost = routes.sessionVisibility === true && SESSION_VISIBILITY_PATH.test(c.req.path) && SESSION_VISIBILITY_PATH.test(url);
+    if (c.req.method === "GET" || (login && c.req.method === "POST") || (tokenRoute && c.req.method === "POST") || ((advisoryAck || visibilityPost) && c.req.method === "POST") || (routes.cors === true && c.req.method === "OPTIONS")) return app.fetch(c.req.raw);
     if (tokenRoute) return c.json(errorJson("method_not_allowed", "POST only"), 405, { allow: "POST" });
     return login
       ? c.json(errorJson("method_not_allowed", "GET or POST only"), 405, { allow: "GET, POST" })
@@ -138,14 +142,14 @@ function readCappedBody(req: IncomingMessage, cap: number): Promise<Buffer | "to
  * request the body is drained, never read. Bodies and header values are never
  * logged.
  */
-export function readApiHttpServer(handler: FetchApp, options: { readLoginBody?: boolean; tokenRoutes?: boolean; advisoryAck?: boolean } = {}): Server {
+export function readApiHttpServer(handler: FetchApp, options: { readLoginBody?: boolean; tokenRoutes?: boolean; advisoryAck?: boolean; sessionVisibility?: boolean } = {}): Server {
   return createServer((req, res) => {
     void (async () => {
       try {
         const url = `http://localhost${req.url?.startsWith("/") ? req.url : "/"}`;
         let body: Buffer | undefined;
         const pathname = new URL(url).pathname;
-        if (req.method === "POST" && ((options.readLoginBody === true && pathname === LOGIN_PATH) || (options.tokenRoutes === true && TOKEN_ROUTE_PATHS.includes(pathname)) || (options.advisoryAck === true && ADVISORY_ACK_PATH.test(pathname)))) {
+        if (req.method === "POST" && ((options.readLoginBody === true && pathname === LOGIN_PATH) || (options.tokenRoutes === true && TOKEN_ROUTE_PATHS.includes(pathname)) || (options.advisoryAck === true && ADVISORY_ACK_PATH.test(pathname)) || (options.sessionVisibility === true && SESSION_VISIBILITY_PATH.test(pathname)))) {
           const read = await readCappedBody(req, LOGIN_BODY_CAP_BYTES);
           if (read === "too_large") {
             // The app is never called; the connection is closed once the 413 is out so the rest of the upload is not consumed.
@@ -204,7 +208,8 @@ export async function startReadApiService(
   const tokenRoutes = built !== null && readApiAuthMode(env) === "self_issued";
   const cors = built !== null && readApiCorsOrigins(env).size > 0;
   const advisoryAck = built !== null && exactTrueFlag(env[READ_API_COORDINATION_ADVISORIES_ENABLED]);
-  const server = readApiHttpServer(readApiServiceApp(built?.app ?? null, { tokenRoutes, cors, ...(advisoryAck ? { advisoryAck } : {}) }), { readLoginBody: built !== null, tokenRoutes, ...(advisoryAck ? { advisoryAck } : {}) });
+  const sessionVisibility = built !== null && parseSessionVisibilityGroups(env) !== undefined;
+  const server = readApiHttpServer(readApiServiceApp(built?.app ?? null, { tokenRoutes, cors, ...(advisoryAck ? { advisoryAck } : {}), ...(sessionVisibility ? { sessionVisibility } : {}) }), { readLoginBody: built !== null, tokenRoutes, ...(advisoryAck ? { advisoryAck } : {}), ...(sessionVisibility ? { sessionVisibility } : {}) });
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);

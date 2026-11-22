@@ -118,6 +118,7 @@ A self-host's relaycontrol proxies History reads with a user's `sh_at_` token. T
   - Every query binds org and workspace from auth.
   - Why not the claim-bound RPCs now: the search-worker role admits only `authenticator` as a member (`session_directory_search_worker_verify.sql:101-140`). Adding another member is a HoopDb security-model change. **Phase C** routes lists through those RPCs, either through PostgREST with a short-lived JWT or through an approved second member edge, and that decision goes to the HoopDb owner.
   - Phase A needs only liveness, which carries no tenant content.
+- **Within a workspace (self-host SERVICE only, default off):** `READ_API_SESSION_VISIBILITY_GROUPS` restricts a marked session to the members of its group on every read route, and adds `GET`/`POST /v1/sessions/:sessionId/visibility` (migration `20261105062141`). Unset, nothing is read and nothing changes. See [session-visibility.md](session-visibility.md).
 
 ## 4. ClickHouse query rules
 

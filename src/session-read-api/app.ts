@@ -73,6 +73,12 @@ import { SummaryFallbackError, sessionSummaryBody, type SummaryFallback } from "
  *   POST /v1/sessions/:id/analysis  20261105046000 and its S3 result objects; same allowlist;
  *                                   POST needs `rth:sync` and the admission principal.
  *
+ * Session visibility (READ_API_SESSION_VISIBILITY_GROUPS, self-host service only; session-visibility.ts,
+ * docs/session-visibility.md): a session marked with a group is hidden from every other caller on all
+ * routes above; unregistered and inert when unset.
+ *   GET  /v1/sessions/:id/visibility  the id's mark, for a member or marker of its group
+ *   POST /v1/sessions/:id/visibility  set or clear it
+ *
  * Auth: a RelayAuth assertion JWT minted for THIS service's origin with scope
  * `rth:read` (verifyAgentRelayToken: RS256, JWKS, issuer, exact audience).
  * Org and workspace come only from the verified claims.
@@ -173,6 +179,8 @@ import {
 } from "./selfhost.ts";
 import { registerSelfIssuedRoutes, type SelfIssuedDeps } from "./self-issued.ts";
 import { registerRelayfactsRoutes, type Relayfacts } from "./relayfacts.ts";
+import { MAX_EXCLUDED_SESSIONS } from "@rhc/search-index/contracts.ts";
+import { SESSION_VISIBILITY_MAX_BODY_BYTES, SESSION_VISIBILITY_PATH, VisibilityRefusal, type SessionVisibility, type VisibilityView } from "./session-visibility.ts";
 
 /**
  * The only scopes POST /v1/cli/login advertises (next to LOGIN_MAX_TTL_MS, selfhost.ts). This backend
@@ -351,6 +359,12 @@ export interface ReadApiDeps {
   searchSkipsPartialSessions?: boolean;
   /** READ_API_CORS_ALLOWED_ORIGINS, service entry only: exact origins GET read routes answer CORS for. Absent/empty = no CORS. */
   corsAllowedOrigins?: ReadonlySet<string>;
+  /**
+   * READ_API_SESSION_VISIBILITY_GROUPS, service entry only (session-visibility.ts, docs/session-visibility.md):
+   * a session marked with a group is served only to that group's members, on every route, and GET/POST
+   * /v1/sessions/:sessionId/visibility read and set the mark. Absent = no marks read, no route, nothing changes.
+   */
+  sessionVisibility?: SessionVisibility;
 }
 
 export interface AnalysisDeps {
@@ -419,6 +433,8 @@ const MAX_AGENT_LENGTH = 200;
 const SUMMARY_SEARCH_PATH = "/v1/sessions/summaries/search";
 /** GET /v1/sessions/:sessionId/sources: fence-checks its own sources (both key forms) after its flag. */
 const SESSION_SOURCES_PATH = /^\/v1\/sessions\/[^/]+\/sources$/u;
+/** The literal routes under /v1/sessions/ that the per-session visibility gate must not read as a session id. */
+const SESSION_LIST_PATHS: ReadonlySet<string> = new Set(["/v1/sessions/activity", "/v1/sessions/users", "/v1/sessions/output", "/v1/sessions/titles", "/v1/sessions/summaries/activity", SUMMARY_SEARCH_PATH]);
 const HARNESS_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 /** Session-list parameters the directory cannot answer: event or text questions. */
 /** The only parameters GET /v1/sessions/users reads; any other is not silently ignored (501). */
@@ -561,6 +577,8 @@ export function createReadApi(deps: ReadApiDeps) {
       requestStarted: number;
       /** READ_API_OWNER_BUFFERED_PHASE_LOG=1: the events route's owner-buffered phase times, added to the request line. */
       obPhases?: OwnerBufferedPhaseTimer;
+      /** deps.sessionVisibility only: the caller's view of the workspace's marks, read once for this request. */
+      visibility?: VisibilityView;
     };
   }>();
   const log = deps.log ?? (() => {});
@@ -686,7 +704,8 @@ export function createReadApi(deps: ReadApiDeps) {
       if (c.req.method === "OPTIONS") {
         if (allowed) {
           // The advisory ack is the one CORS POST, and only while its routes are enabled.
-          const ackPost = deps.coordinationAdvisories?.enabled === true && ADVISORY_ACK_PATH.test(c.req.path);
+          // ...and, with session visibility configured, the visibility POST.
+          const ackPost = (deps.coordinationAdvisories?.enabled === true && ADVISORY_ACK_PATH.test(c.req.path)) || (deps.sessionVisibility !== undefined && SESSION_VISIBILITY_PATH.test(c.req.path));
           c.header("Access-Control-Allow-Methods", ackPost ? "GET, POST" : "GET");
           c.header("Access-Control-Allow-Headers", ackPost ? "authorization, content-type, x-correlation-id" : "authorization, x-correlation-id");
           c.header("Access-Control-Max-Age", "600");
@@ -758,6 +777,43 @@ export function createReadApi(deps: ReadApiDeps) {
 
   const pageDeps = () => ({ ch: deps.ch, adapter: deps.adapter, completeSinceMs: deps.completeSinceMs, liveness: deps.liveness, timeoutMs: deps.timeoutMs, bufferedGate: deps.bufferedSearchGate });
 
+  /**
+   * Session visibility (deps.sessionVisibility; docs/session-visibility.md). The workspace's marks are read
+   * once per request, after the bearer verified, and the rest of the request runs with the caller's view in
+   * scope. A failed read fails the request (503): never an unfiltered answer.
+   */
+  const visibility = deps.sessionVisibility;
+  /** The request's view; undefined only when visibility is not configured. Configured without a view is refused, never unfiltered. */
+  const viewOf = (c: Context): VisibilityView | undefined => {
+    if (!visibility) return undefined;
+    const view = c.get("visibility") as VisibilityView | undefined;
+    if (!view) throw new HttpError(503, "backend_unavailable", "read backend unavailable");
+    return view;
+  };
+  /** True when visibility is configured and `sessionId` is hidden from this request's caller. */
+  const hidden = (c: Context, sessionId: unknown): boolean => viewOf(c)?.hides(sessionId) === true;
+  const sessionNotFound = () => new HttpError(404, "not_found", "Session not found");
+  if (visibility) {
+    app.use("/v1/*", async (c, next) => {
+      let view: VisibilityView;
+      try {
+        view = await visibility.view(c.get("identity"));
+      } catch {
+        return fail(c, new HttpError(503, "backend_unavailable", "read backend unavailable"));
+      }
+      c.set("visibility", view);
+      return visibility.run(view, next);
+    });
+    // Every route of one session, present or future, whatever its parameters (`source=` or none) and
+    // whichever form of the id is asked: a hidden session answers the operator erase fence's 404 before
+    // the route runs. The literal list routes are not sessions; the visibility route answers for itself.
+    app.use("/v1/sessions/:sessionId/*", async (c, next) => {
+      if (SESSION_LIST_PATHS.has(c.req.path) || SESSION_VISIBILITY_PATH.test(c.req.path)) return next();
+      if (hidden(c, c.req.param("sessionId"))) return fail(c, sessionNotFound());
+      await next();
+    });
+  }
+
   if (deps.operatorErased) app.use("/v1/sessions/:sessionId/*", async (c, next) => {
     // The workspace-wide summary search is a literal sub-path, not a session: never treat "summaries" as a
     // session id here (no fence lookup, and no attestation ahead of the route's own flag check).
@@ -824,7 +880,8 @@ export function createReadApi(deps: ReadApiDeps) {
    */
   function ownerBufferedFor(identity: VerifiedIdentity): OwnerBufferedDeps | undefined {
     const ob = deps.ownerBuffered;
-    if (!ob || ob.enabled !== true || !identity.userId) return undefined;
+    // Buffered rows carry no visibility filter: with session visibility configured they are not served.
+    if (!ob || ob.enabled !== true || !identity.userId || visibility) return undefined;
     const listed = (allowed: ReadonlySet<string> | "*" | undefined) => !!allowed && (allowed === "*" || allowed.has(identity.workspaceId));
     if (!listed(deps.directoryWorkspaces) || !listed(ob.workspaces)) return undefined;
     return ob;
@@ -1065,6 +1122,7 @@ export function createReadApi(deps: ReadApiDeps) {
       const base: EventQuery = { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source, kind, projectId: project, ...(origin === undefined ? {} : { actorName: origin }), q, sinceMs, untilMs, order, limit: 0, maxContent, cursor };
 
       if (sessionId !== undefined) {
+        if (hidden(c, sessionId)) throw sessionNotFound();
         base.limit = clampLimit(single(c, "limit"), EVENTS_DEFAULT_LIMIT, EVENTS_MAX_LIMIT);
         if ((await sessionGate(identity, sessionId, source, cursor !== undefined)) === "empty")
           return c.json({ events: [], nextCursor: null, correlationId: c.get("correlationId") });
@@ -1100,13 +1158,22 @@ export function createReadApi(deps: ReadApiDeps) {
         const partials = await partialSessionsInWorkspace(pageDeps(), identity.orgId, identity.workspaceId);
         if (partials.overflow) incomplete = { reason: "session_partial_unbounded" };
         else if (partials.sessions.length > 0) {
-          incomplete = { reason: "session_partial", sessions: partials.sessions };
+          // A hidden partial session is excluded like the others and never named.
+          incomplete = { reason: "session_partial", sessions: partials.sessions.filter((id) => !hidden(c, id)) };
           base.excludeSessionIds = partials.sessions;
         }
       } else if (cursor === undefined) {
         const partials = await partialSessionsInWorkspace(pageDeps(), identity.orgId, identity.workspaceId);
         if (partials.overflow) throw unsupported("session_partial_unbounded");
         if (partials.sessions.length > 0) throw unsupported("session_partial");
+      }
+      // Session visibility: hidden sessions are left out by the index itself, on every page, so neither a
+      // row nor a cursor position of one is ever produced. More than the index can exclude is refused.
+      const hiddenIds = viewOf(c)?.hidden;
+      if (hiddenIds && hiddenIds.size > 0) {
+        const excluded = [...new Set([...(base.excludeSessionIds ?? []), ...hiddenIds])];
+        if (excluded.length > MAX_EXCLUDED_SESSIONS) throw unsupported("session_visibility_unbounded");
+        base.excludeSessionIds = excluded;
       }
       const page = await gatedPage(c, base);
       if (belowFloor && page.nextCursor === null) {
@@ -1278,6 +1345,29 @@ export function createReadApi(deps: ReadApiDeps) {
       throw bad("the q date terms do not overlap the requested time window");
   }
 
+  /**
+   * One directory page's rows without the caller's hidden sessions (session visibility). It reads on until
+   * it holds limit + 1 visible rows or the directory ends, so the page is full and its cursor is a row the
+   * caller was shown, never a hidden session's id or time. With nothing hidden it is the one read it replaces.
+   */
+  async function visibleDirectoryRows(c: Context, limit: number, cursor: DirectoryCursor | undefined, read: (cursor: DirectoryCursor | undefined) => Promise<Array<DirectoryListRow & { cursor_ts?: string }> | null>) {
+    if (!viewOf(c)?.hidden.size) return read(cursor);
+    const visible: Array<DirectoryListRow & { cursor_ts?: string }> = [];
+    for (let reads = 0; reads < 20; reads++) {
+      const rows = await read(cursor);
+      if (rows === null) return null;
+      if (rows.length > limit + 1) throw new DirectoryError("parse");
+      const page = rows.slice(0, limit);
+      for (const row of page) if (!hidden(c, row.session_id) && visible.push(row) > limit) return visible;
+      const last = page[page.length - 1];
+      if (rows.length <= limit || !last) return visible;
+      if (typeof last.cursor_ts !== "string") throw new DirectoryError("parse");
+      cursor = { lastActivityAt: last.cursor_ts, sessionId: last.session_id, harness: last.harness };
+    }
+    // Fail closed: too many hidden rows in a row to fill a page within the read bound.
+    throw unsupported("session_visibility_unbounded");
+  }
+
   app.get("/v1/sessions", async (c) => {
     try {
       const identity = c.get("identity");
@@ -1346,7 +1436,7 @@ export function createReadApi(deps: ReadApiDeps) {
         if (qCursor === "foreign") throw new CursorError("foreign_cursor");
         if (qCursor === "invalid" || (qCursor && qCursor.fingerprint !== fingerprint)) throw new CursorError("invalid_cursor");
         if (qCursor) args.cursor = { lastActivityAt: qCursor.lastActivityAt, sessionId: qCursor.sessionId, harness: qCursor.harness };
-        const rows = await directory.query(identity.orgId, identity.workspaceId, { ...args, terms });
+        const rows = await visibleDirectoryRows(c, limit, args.cursor, (cursor) => directory.query(identity.orgId, identity.workspaceId, { ...(cursor ? { ...args, cursor } : args), terms }));
         if (rows === null) throw unsupported("directory_not_migrated");
         const page = directoryPage(rows, identity, limit, fingerprint, metadata);
         return c.json({ sessions: page.sessions, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
@@ -1359,7 +1449,7 @@ export function createReadApi(deps: ReadApiDeps) {
       if (cursor === "foreign") throw new CursorError("foreign_cursor");
       if (cursor === "invalid") throw new CursorError("invalid_cursor");
       if (cursor) args.cursor = cursor;
-      const rows = await directory.list(identity.orgId, identity.workspaceId, args);
+      const rows = await visibleDirectoryRows(c, limit, args.cursor, (cursor) => directory.list(identity.orgId, identity.workspaceId, cursor ? { ...args, cursor } : args));
       if (rows === null) throw unsupported("directory_not_migrated");
       if (withBuffered) {
         const union = await bufferedListPage(c, identity, ob, rows, { limit, sources, notSources, bounds, metadata });
@@ -1396,6 +1486,9 @@ export function createReadApi(deps: ReadApiDeps) {
       if (deps.sessionQuery === true) {
         const terms = sessionQueryTerms(c, "activity");
         if (terms) {
+          // Session visibility: per-day counts of a text query would tell this caller which words a hidden
+          // session's title or summary holds. Refused (the route's answer without q support) while it has any.
+          if (viewOf(c)?.hidden.size) throw unsupported("param_q");
           const bounds: { lastTsAfter?: Date; lastTsBefore?: Date } = {};
           intersectQueryDates(terms, bounds);
           const rows = await directory.queryActivity(identity.orgId, identity.workspaceId, since, until, { terms, ...bounds });
@@ -1462,7 +1555,8 @@ export function createReadApi(deps: ReadApiDeps) {
     try {
       const identity = c.get("identity");
       // Flag first: flag off answers exactly the not-configured 501, whatever the query says.
-      if (deps.summarySearch !== true || !deps.ch) throw unsupported("summary_search_not_configured");
+      // (Its candidate query and `truncated` flag carry no visibility filter: not served with session visibility on.)
+      if (deps.summarySearch !== true || !deps.ch || visibility) throw unsupported("summary_search_not_configured");
       attestWorkspace(c, identity);
       const directory = directoryFor(identity);
       for (const name of Object.keys(c.req.query())) if (!["workspace", "q", "limit"].includes(name)) throw unsupported(`param_${name}`);
@@ -1673,7 +1767,9 @@ export function createReadApi(deps: ReadApiDeps) {
       const allowed = deps.briefTitleWorkspaces;
       if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported("brief_titles_workspace_not_enabled");
       if (!deps.briefTitles) throw unsupported("brief_titles_not_configured");
-      const keys = titleKeys(c.req.queries("key") ?? []);
+      // A hidden session's key is dropped before the read: it answers as a session with no title.
+      const keys = titleKeys(c.req.queries("key") ?? []).filter((key) => !hidden(c, key.sessionId));
+      if (keys.length === 0) return c.json({ titles: [], correlationId: c.get("correlationId") });
       const rows = await deps.briefTitles.titles(identity.orgId, identity.workspaceId, keys);
       if (rows === null) throw unsupported("brief_titles_not_migrated");
       return c.json({ titles: briefTitleEntries(rows, identity, keys), correlationId: c.get("correlationId") });
@@ -1894,6 +1990,7 @@ export function createReadApi(deps: ReadApiDeps) {
     bad,
     unsupported,
     fail,
+    ...(visibility ? { hidden } : {}),
   });
 
   const turnsFail = (c: Context, error: unknown) => {
@@ -2112,7 +2209,10 @@ export function createReadApi(deps: ReadApiDeps) {
       const recipient = recipientOf(identity, exactlyOnce(c, "source"), exactlyOnce(c, "sessionId"));
       const status = single(c, "status") ?? "pending";
       if (status !== "pending") throw bad("status must be pending");
-      const rows = await advisories.source.pending(recipient);
+      // Session visibility: a hidden recipient has no advisories (no read), and an advisory about a hidden
+      // peer, or citing a hidden session as evidence, is not served.
+      const rows = hidden(c, recipient.sessionId) ? [] : (await advisories.source.pending(recipient))
+        .filter((row) => !hidden(c, row.peerSessionId) && !row.evidence.some((e) => hidden(c, e.sessionId)));
       log({ route: c.req.routePath, reason: "coordination_advisories_served", findings: rows.length, correlation_id: c.get("correlationId") });
       return c.json({ contract: ADVISORIES_CONTRACT, advisories: rows.slice(0, 10).map(advisoryItem), nextCursor: null });
     } catch (error) {
@@ -2143,7 +2243,7 @@ export function createReadApi(deps: ReadApiDeps) {
         if (Object.keys(rest).length > 0) throw bad("body accepts source and sessionId only");
         const recipient = recipientOf(identity, source, sessionId);
         // 404 whether the id is unknown or belongs to another recipient: nothing is disclosed.
-        if (!(await advisories.source.ack(recipient, advisoryId))) throw new HttpError(404, "not_found", "advisory not found");
+        if (hidden(c, recipient.sessionId) || !(await advisories.source.ack(recipient, advisoryId))) throw new HttpError(404, "not_found", "advisory not found");
         log({ route: c.req.routePath, reason: "coordination_advisory_acked", correlation_id: c.get("correlationId") });
         return c.body(null, 204);
       } catch (error) {
@@ -2158,7 +2258,8 @@ export function createReadApi(deps: ReadApiDeps) {
     const correlationId = c.get("correlationId");
     try {
       const evidence = deps.babysitter;
-      if (!evidence) throw unsupported("delivery_records_not_configured");
+      // Delivery records name sessions and carry no visibility filter: not served with session visibility on.
+      if (!evidence || visibility) throw unsupported("delivery_records_not_configured");
       const identity = c.get("identity");
       const query: Record<string, string> = {};
       for (const key of new Set(new URL(c.req.url).searchParams.keys())) {
@@ -2222,6 +2323,8 @@ export function createReadApi(deps: ReadApiDeps) {
               }),
             ]);
             payload = catalogFromCanonical(scope, snapshot);
+            // Session visibility: a hidden child session is not listed by its visible parent.
+            if (visibility) payload = { ...payload, children: payload.children.filter((child) => !hidden(c, child.childSessionId)) };
           } finally {
             clearTimeout(timer);
           }
@@ -2305,6 +2408,53 @@ export function createReadApi(deps: ReadApiDeps) {
       return fail(c, error);
     }
   });
+
+  /**
+   * GET / POST /v1/sessions/:sessionId/visibility?workspace= (session visibility only; docs/session-visibility.md).
+   * GET: the id's current mark, for a member or marker of that mark's group (an unmarked id is "workspace");
+   * 404 for everyone else. POST `{"visibility":"<group>"|"workspace"}`: a member or marker of the group sets
+   * it, a member clears or replaces it; 403 otherwise, 400 for a bad body or a group that is not configured.
+   * The id need not exist yet. Both answer `{sessionId, visibility, markedBy, markedAt}`.
+   */
+  if (visibility) {
+    const visibilityFail = (c: Context, error: unknown) =>
+      fail(c, error instanceof VisibilityRefusal ? new HttpError(error.status, error.code, error.message) : error);
+    const markedSession = (c: Context) => {
+      attestWorkspace(c, c.get("identity"));
+      const sessionId = c.req.param("sessionId");
+      if (!sessionId || sessionId.length > MAX_ID_CHARS || /[\x00-\x1f\x7f]/u.test(sessionId)) throw bad("sessionId is not valid");
+      return sessionId;
+    };
+    app.get("/v1/sessions/:sessionId/visibility", (c) => {
+      try {
+        return c.json({ ...viewOf(c)!.state(markedSession(c)), correlationId: c.get("correlationId") });
+      } catch (error) {
+        return visibilityFail(c, error);
+      }
+    });
+    app.post("/v1/sessions/:sessionId/visibility",
+      bodyLimit({ maxSize: SESSION_VISIBILITY_MAX_BODY_BYTES, onError: (c) => c.json({ error: { code: "body_too_large", message: "body is too large" }, correlationId: c.get("correlationId") }, 413) }),
+      async (c) => {
+        try {
+          const sessionId = markedSession(c);
+          let body: unknown;
+          try {
+            body = await c.req.json();
+          } catch {
+            throw bad("body must be JSON");
+          }
+          if (typeof body !== "object" || body === null || Array.isArray(body)) throw bad("body must be a JSON object");
+          const { visibility: wanted, ...rest } = body as Record<string, unknown>;
+          if (Object.keys(rest).length > 0 || typeof wanted !== "string" || wanted === "" || wanted.length > 64) throw bad("body accepts visibility only");
+          const state = await visibility.set(c.get("identity"), sessionId, wanted);
+          // Counts nothing and names nothing: the route, and that a mark was written.
+          log({ route: c.req.routePath, reason: "session_visibility_set", status: 200, correlation_id: c.get("correlationId") });
+          return c.json({ ...state, correlationId: c.get("correlationId") });
+        } catch (error) {
+          return visibilityFail(c, error);
+        }
+      });
+  }
 
   app.notFound((c) => c.json({ error: { code: "unsupported_by_backend", message: "route not served by this backend", reason: "route" }, correlationId: c.get("correlationId") }, 501));
 

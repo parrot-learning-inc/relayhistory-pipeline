@@ -1721,6 +1721,14 @@
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
     ],
+    "sessions.session_visibility_marks_v1(text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.session_visibility_set_v1(text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.set_session_brief_documents_live(boolean)": [
       "<owner>:EXECUTE"
     ],
